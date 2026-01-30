@@ -90,7 +90,23 @@ app.post('/v1/chat/completions', async (req, res) => {
         }
       }
     }
-    
+        // 🔥 Inject Nemotron reasoning system prompt if thinking mode is enabled
+    if (
+      ENABLE_THINKING_MODE &&
+      nimModel &&
+      nimModel.toLowerCase().includes("nemotron")
+    ) {
+      const hasThinkingPrompt = messages.some(
+        m => m.role === "system" && typeof m.content === "string" && m.content.includes("detailed thinking on")
+      );
+
+      if (!hasThinkingPrompt) {
+        messages.unshift({
+          role: "system",
+          content: "detailed thinking on"
+        });
+      }
+    }
     // Transform OpenAI request to NIM format
     const nimRequest = {
       model: nimModel,
