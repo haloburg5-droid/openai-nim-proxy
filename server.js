@@ -153,35 +153,28 @@ const nimRequest = {
               if (data.choices?.[0]?.delta) {
                 const reasoning = data.choices[0].delta.reasoning_content;
                 const content = data.choices[0].delta.content;
-                
                 if (SHOW_REASONING) {
-                  let combinedContent = '';
-                  
-                  if (reasoning && !reasoningStarted) {
-                    combinedContent = '<think>\\n' + reasoning;
-                    reasoningStarted = true;
-                  } else if (reasoning) {
-                    combinedContent = reasoning;
-                  }
-                  
-                  if (content && reasoningStarted) {
-                    combinedContent += '</think>\\n\\n' + content;
-                    reasoningStarted = false;
-                  } else if (content) {
-                    combinedContent += content;
-                  }
-                  
-                  if (combinedContent) {
-                    data.choices[0].delta.content = combinedContent;
+                    // 1. If the chunk contains reasoning, pass it and open the tag cleanly
+                    if (reasoning) {
+                        if (!reasoningStarted) {
+                            data.choices[0].delta.content = '<think>\n' + reasoning;
+                            reasoningStarted = true;
+                        } else {
+                            data.choices[0].delta.content = reasoning;
+                        }
+                    } 
+                    // 2. The exact moment it flips to standard content, shut the tag
+                    else if (content) {
+                        if (reasoningStarted) {
+                            data.choices[0].delta.content = '</think>\n\n' + content;
+                            reasoningStarted = false;
+                        } else {
+                            data.choices[0].delta.content = content;
+                        }
+                    }
+                    
+                    // Remove the extra parameter so JanitorAI doesn't error out
                     delete data.choices[0].delta.reasoning_content;
-                  }
-                } else {
-                  if (content) {
-                    data.choices[0].delta.content = content;
-                  } else {
-                    data.choices[0].delta.content = '';
-                  }
-                  delete data.choices[0].delta.reasoning_content;
                 }
               }
               res.write(`data: ${JSON.stringify(data)}\\n\\n`);
