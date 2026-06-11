@@ -110,18 +110,14 @@ app.post('/v1/chat/completions', async (req, res) => {
       }
     }
     // Transform OpenAI request to NIM format
-//  Fixed block: Destructure chat_template_kwargs directly into the root body
+// Clean fix: Completely strip out extra_body / chat_template_kwargs
 const nimRequest = {
   model : nimModel,
   messages : messages,
   temperature : temperature || 0.6,
   max_tokens : max_tokens || 9024,
-  stream : stream || false,
-  ...(ENABLE_THINKING_MODE && nimModel.toLowerCase().includes('qwen') 
-    ? { chat_template_kwargs: { thinking: true } } 
-    : {})
+  stream : stream || false
 };
-    
     // Make request to NVIDIA NIM API
     const response = await axios.post(`${NIM_API_BASE}/chat/completions`, nimRequest, {
       headers: {
