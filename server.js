@@ -233,17 +233,23 @@ app.post('/v1/chat/completions', async (req, res) => {
       res.json(openaiResponse);
     }
     
-  } catch (error) {
-    console.error('Proxy error:', error.message);
-    
+} catch (error) {
+    // 🔍 This prints out exactly what parameter NVIDIA NIM rejected
+    if (error.response && error.response.data) {
+        console.error('NVIDIA API Error Response:', JSON.stringify(error.response.data));
+    } else {
+        console.error('Proxy error:', error.message);
+    }
+
     res.status(error.response?.status || 500).json({
-      error: {
-        message: error.message || 'Internal server error',
-        type: 'invalid_request_error',
-        code: error.response?.status || 500
-      }
+        error: {
+            // Passes the exact raw error message from NVIDIA back to JanitorAI
+            message: error.response?.data?.error?.message || error.message || 'Internal server error',
+            type: 'invalid_request_error',
+            code: error.response?.status || 500
+        }
     });
-  }
+}
 });
 
 // Catch-all for unsupported endpoints
