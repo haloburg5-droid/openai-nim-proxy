@@ -144,10 +144,11 @@ app.post('/v1/chat/completions', async (req, res) => {
                         try {
                             const data = JSON.parse(line.slice(6));
                             if (data.choices?.[0]?.delta) {
-                                const reasoning = data.choices[0].delta.reasoning_content;
-                                const content = data.choices[0].delta.content;
-
+                                const content = data.choices[0].delta.content || '';
+                                const reasoning = data.choices[0].delta.reasoning_content || '';
+                            
                                 if (SHOW_REASONING) {
+                                    // 1. Handle native reasoning_content (for Qwen fallback)
                                     if (reasoning) {
                                         if (!reasoningStarted) {
                                             data.choices[0].delta.content = '<think>\n' + reasoning;
@@ -155,10 +156,16 @@ app.post('/v1/chat/completions', async (req, res) => {
                                         } else {
                                             data.choices[0].delta.content = reasoning;
                                         }
-                                    } else if (content) {
+                                    } 
+                                    // 2. Handle GLM-5.1's unified content stream
+                                    else if (content) {
                                         if (reasoningStarted) {
                                             data.choices[0].delta.content = '</think>\n\n' + content;
                                             reasoningStarted = false;
+                                        } else if (!reasoningStarted && content.trim().startsWith('Thinking Process:')) {
+                                            // Catches raw text planning blocks if labeled
+                                            data.choices[0].delta.content = '<think>\n' + content;
+                                            reasoningStarted = true;
                                         } else {
                                             data.choices[0].delta.content = content;
                                         }
