@@ -111,21 +111,22 @@ app.post('/v1/chat/completions', async (req, res) => {
     }
     // Transform OpenAI request to NIM format
 // Clean fix: Completely strip out extra_body / chat_template_kwargs
+// Clean structure: Passes the exact parameters GLM and Qwen want
 const nimRequest = {
-  model : nimModel,
-  messages : messages,
-  temperature : temperature || 0.6,
-  max_tokens : max_tokens || 9024,
-  stream : stream || false
+  model: nimModel,
+  messages: messages,
+  temperature: temperature || 0.6,
+  max_tokens: max_tokens || 9024,
+  stream: stream || false,
+  
+  // Inject the precise thinking tags the models look for on NVIDIA NIM
+  ...(ENABLE_THINKING_MODE ? {
+    chat_template_kwargs: {
+      ...(nimModel.toLowerCase().includes('qwen') ? { thinking: true } : {}),
+      ...(nimModel.toLowerCase().includes('glm') ? { enable_thinking: true, clear_thinking: false } : {})
+    }
+  } : {})
 };
-    // Make request to NVIDIA NIM API
-    const response = await axios.post(`${NIM_API_BASE}/chat/completions`, nimRequest, {
-      headers: {
-        'Authorization': `Bearer ${NIM_API_KEY}`,
-        'Content-Type': 'application/json'
-      },
-      responseType: stream ? 'stream' : 'json'
-    });
     
     if (stream) {
       // Handle streaming response with reasoning
