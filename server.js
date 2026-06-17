@@ -104,15 +104,13 @@ app.post('/v1/chat/completions', async (req, res) => {
           temperature: temperature || 0.6,
           max_tokens: max_tokens || 9024,
           stream: stream || false,
-          
-          // FIX: Force official Z-AI parameter for GLM series
-          ...(nimModel.toLowerCase().includes('glm') ? {
-            thinking: { type: "enabled" }
-          } : {}),
         
-          // Keep chat_template_kwargs for Qwen series
-          ...(ENABLE_THINKING_MODE && nimModel.toLowerCase().includes('qwen') ? {
-            chat_template_kwargs: { thinking: true }
+          // Inject precise parameters for Qwen and GLM directly into chat_template_kwargs
+          ...(ENABLE_THINKING_MODE ? {
+            chat_template_kwargs: {
+              ...(nimModel.toLowerCase().includes('qwen') ? { thinking: true } : {}),
+              ...(nimModel.toLowerCase().includes('glm') ? { thinking: true } : {}) // NVIDIA NIM requires 'thinking: true' for GLM as well
+            }
           } : {})
         };
 
@@ -154,6 +152,7 @@ app.post('/v1/chat/completions', async (req, res) => {
                                 if (SHOW_REASONING) {
                                     if (reasoning) {
                                         if (!reasoningStarted) {
+                                            // Injects the opening markdown block
                                             data.choices[0].delta.content = '<think>\n' + reasoning;
                                             reasoningStarted = true;
                                         } else {
@@ -161,6 +160,7 @@ app.post('/v1/chat/completions', async (req, res) => {
                                         }
                                     } else if (content) {
                                         if (reasoningStarted) {
+                                            // Safely wraps it when the primary generation begins
                                             data.choices[0].delta.content = '</think>\n\n' + content;
                                             reasoningStarted = false;
                                         } else {
@@ -169,10 +169,9 @@ app.post('/v1/chat/completions', async (req, res) => {
                                     }
                                 }
                                 
-                                // FIX: Move the deletion AFTER we've already written it to Janitor, or remove it entirely
+                                // Deletes the non-standard property right before sending to client
                                 delete data.choices[0].delta.reasoning_content;
-                            }
-                            
+                            }          
                             // This line sends the data to JanitorAI
                             res.write(`data: ${JSON.stringify(data)}\n\n`);
                         } catch (e) {
