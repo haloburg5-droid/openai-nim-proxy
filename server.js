@@ -97,19 +97,23 @@ app.post('/v1/chat/completions', async (req, res) => {
         }
 
         // Build the raw HTTP request payload for NVIDIA NIM
+        // Build the raw HTTP request payload for NVIDIA NIM
         const nimRequest = {
-            model: nimModel,
-            messages: messages,
-            temperature: temperature || 0.6,
-            max_tokens: max_tokens || 9024,
-            stream: stream || false,
-            // Inject precise parameters for Qwen and GLM directly into the body root
-            ...(ENABLE_THINKING_MODE ? {
-                chat_template_kwargs: {
-                    ...(nimModel.toLowerCase().includes('qwen') ? { thinking: true } : {}),
-                    ...(nimModel.toLowerCase().includes('glm') ? { enable_thinking: true, clear_thinking: false } : {})
-                }
-            } : {})
+          model: nimModel,
+          messages: messages,
+          temperature: temperature || 0.6,
+          max_tokens: max_tokens || 9024,
+          stream: stream || false,
+          
+          // FIX: Force official Z-AI parameter for GLM series
+          ...(nimModel.toLowerCase().includes('glm') ? {
+            thinking: { type: "enabled" }
+          } : {}),
+        
+          // Keep chat_template_kwargs for Qwen series
+          ...(ENABLE_THINKING_MODE && nimModel.toLowerCase().includes('qwen') ? {
+            chat_template_kwargs: { thinking: true }
+          } : {})
         };
 
         // Fire the HTTP request to NVIDIA NIM
@@ -148,33 +152,28 @@ app.post('/v1/chat/completions', async (req, res) => {
                                 let reasoning = data.choices[0].delta.reasoning_content || '';
                             
                                 if (SHOW_REASONING) {
-                                    // 1. Capture the hidden reasoning_content field
                                     if (reasoning) {
                                         if (!reasoningStarted) {
-                                            // First chunk of reasoning: inject the opening tag
                                             data.choices[0].delta.content = '<think>\n' + reasoning;
                                             reasoningStarted = true;
                                         } else {
-                                            // Ongoing reasoning: pass it directly as visible content
                                             data.choices[0].delta.content = reasoning;
                                         }
-                                    } 
-                                    // 2. Capture when it transitions back to the main response content
-                                    else if (content) {
+                                    } else if (content) {
                                         if (reasoningStarted) {
-                                            // First chunk of actual response text: close the think tag safely
                                             data.choices[0].delta.content = '</think>\n\n' + content;
                                             reasoningStarted = false;
                                         } else {
-                                            // Regular content stream continues normally
                                             data.choices[0].delta.content = content;
                                         }
                                     }
                                 }
-                            
-                                // Safely remove the non-standard field so Janitor doesn't choke on it
+                                
+                                // FIX: Move the deletion AFTER we've already written it to Janitor, or remove it entirely
                                 delete data.choices[0].delta.reasoning_content;
                             }
+                            
+                            // This line sends the data to JanitorAI
                             res.write(`data: ${JSON.stringify(data)}\n\n`);
                         } catch (e) {
                             res.write(line + '\n');
