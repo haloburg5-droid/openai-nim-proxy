@@ -144,40 +144,36 @@ app.post('/v1/chat/completions', async (req, res) => {
                         try {
                             const data = JSON.parse(line.slice(6));
                             if (data.choices?.[0]?.delta) {
-                                const content = data.choices[0].delta.content || '';
-                                const reasoning = data.choices[0].delta.reasoning_content || '';
+                                let content = data.choices[0].delta.content || '';
+                                let reasoning = data.choices[0].delta.reasoning_content || '';
                             
                                 if (SHOW_REASONING) {
-                                    // 1. Handle native reasoning_content (for Qwen fallback)
+                                    // 1. Capture the hidden reasoning_content field
                                     if (reasoning) {
                                         if (!reasoningStarted) {
+                                            // First chunk of reasoning: inject the opening tag
                                             data.choices[0].delta.content = '<think>\n' + reasoning;
                                             reasoningStarted = true;
                                         } else {
+                                            // Ongoing reasoning: pass it directly as visible content
                                             data.choices[0].delta.content = reasoning;
                                         }
                                     } 
-                                    // 2. Handle GLM-5.1's unified content stream
-                                    // 2. Handle GLM-5.1's unified content stream
+                                    // 2. Capture when it transitions back to the main response content
                                     else if (content) {
-                                      if (reasoningStarted) {
-                                        // If we hit a double newline or a clear transition, close the think tag
-                                        if (content.includes('\n\n') || content.startsWith('Artificial intelligence') || content.startsWith('The')) { 
-                                          data.choices[0].delta.content = '</think>\n\n' + content;
-                                          reasoningStarted = false;
+                                        if (reasoningStarted) {
+                                            // First chunk of actual response text: close the think tag safely
+                                            data.choices[0].delta.content = '</think>\n\n' + content;
+                                            reasoningStarted = false;
                                         } else {
-                                          data.choices[0].delta.content = content;
+                                            // Regular content stream continues normally
+                                            data.choices[0].delta.content = content;
                                         }
-                                      } else if (!reasoningStarted && content.toLowerCase().includes('thinking')) {
-                                        // A much broader check to catch the start of the reasoning block early
-                                        data.choices[0].delta.content = '<think>\n' + content;
-                                        reasoningStarted = true;
-                                      } else {
-                                        data.choices[0].delta.content = content;
-                                      }
                                     }
-                                    delete data.choices[0].delta.reasoning_content;
                                 }
+                            
+                                // Safely remove the non-standard field so Janitor doesn't choke on it
+                                delete data.choices[0].delta.reasoning_content;
                             }
                             res.write(`data: ${JSON.stringify(data)}\n\n`);
                         } catch (e) {
