@@ -27,7 +27,7 @@ const MODEL_MAPPING = {
   'gpt-3.5-turbo': 'deepseek-ai/deepseek-v4-flash',
   'gpt-4': 'qwen/qwen3.5-397b-a17b',
   'gpt-4-turbo': 'moonshotai/kimi-k2.6',
-  'gpt-4o': 'deepseek-ai/deepseek-v3.2',
+  'gpt-4o': 'nvidia/nemotron-3-ultra-550b-a55b',
   'claude-3-opus': 'z-ai/glm-5.1',
   'claude-3-sonnet': 'deepseek-ai/deepseek-v4-pro',
   'gemini-pro': 'mistralai/mistral-large-3-675b-instruct-2512' 
@@ -158,17 +158,23 @@ app.post('/v1/chat/completions', async (req, res) => {
                                         }
                                     } 
                                     // 2. Handle GLM-5.1's unified content stream
+                                    // 2. Handle GLM-5.1's unified content stream
                                     else if (content) {
-                                        if (reasoningStarted) {
-                                            data.choices[0].delta.content = '</think>\n\n' + content;
-                                            reasoningStarted = false;
-                                        } else if (!reasoningStarted && content.trim().startsWith('Thinking Process:')) {
-                                            // Catches raw text planning blocks if labeled
-                                            data.choices[0].delta.content = '<think>\n' + content;
-                                            reasoningStarted = true;
+                                      if (reasoningStarted) {
+                                        // If we hit a double newline or a clear transition, close the think tag
+                                        if (content.includes('\n\n') || content.startsWith('Artificial intelligence') || content.startsWith('The')) { 
+                                          data.choices[0].delta.content = '</think>\n\n' + content;
+                                          reasoningStarted = false;
                                         } else {
-                                            data.choices[0].delta.content = content;
+                                          data.choices[0].delta.content = content;
                                         }
+                                      } else if (!reasoningStarted && content.toLowerCase().includes('thinking')) {
+                                        // A much broader check to catch the start of the reasoning block early
+                                        data.choices[0].delta.content = '<think>\n' + content;
+                                        reasoningStarted = true;
+                                      } else {
+                                        data.choices[0].delta.content = content;
+                                      }
                                     }
                                     delete data.choices[0].delta.reasoning_content;
                                 }
