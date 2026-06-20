@@ -16,10 +16,10 @@ app.use(express.json({
 const NIM_API_BASE = process.env.NIM_API_BASE || 'https://integrate.api.nvidia.com/v1';
 const NIM_API_KEY = process.env.NIM_API_KEY;
 
-// 🔥 REASONING DISPLAY TOGGLE - Shows/hides reasoning in output
+// REASONING DISPLAY TOGGLE - Shows/hides reasoning in output
 const SHOW_REASONING = true; // Set to true to show reasoning with <think> tags
 
-// 🔥 THINKING MODE TOGGLE - Enables thinking for specific models that support it
+// THINKING MODE TOGGLE - Enables thinking for specific models that support it
 const ENABLE_THINKING_MODE = true; // Set to true to enable chat_template_kwargs thinking parameter
 
 // Model mapping (adjust based on available NIM models)
@@ -30,14 +30,14 @@ const MODEL_MAPPING = {
   'gpt-4o': 'nvidia/nemotron-3-ultra-550b-a55b',
   'claude-3-opus': 'z-ai/glm-5.1',
   'claude-3-sonnet': 'deepseek-ai/deepseek-v4-pro',
-  'gemini-pro': 'mistralai/mistral-large-3-675b-instruct-2512' 
+  'gemini-pro': 'mistralai/mistral-large-3-675b-instruct-2512'
 };
 
 // Health check endpoint
 app.get('/health', (req, res) => {
-  res.json({ 
-    status: 'ok', 
-    service: 'OpenAI to NVIDIA NIM Proxy', 
+  res.json({
+    status: 'ok',
+    service: 'OpenAI to NVIDIA NIM Proxy',
     reasoning_display: SHOW_REASONING,
     thinking_mode: ENABLE_THINKING_MODE
   });
@@ -51,7 +51,7 @@ app.get('/v1/models', (req, res) => {
     created: Date.now(),
     owned_by: 'nvidia-nim-proxy'
   }));
-  
+
   res.json({
     object: 'list',
     data: models
@@ -97,14 +97,13 @@ app.post('/v1/chat/completions', async (req, res) => {
         }
 
         // Build the raw HTTP request payload for NVIDIA NIM
-        // Build the raw HTTP request payload for NVIDIA NIM
         const nimRequest = {
           model: nimModel,
           messages: messages,
           temperature: temperature || 0.6,
           max_tokens: max_tokens || 9024,
           stream: stream || false,
-        
+
           // Inject precise parameters for Qwen and GLM directly into chat_template_kwargs
           ...(ENABLE_THINKING_MODE ? {
             chat_template_kwargs: {
@@ -129,54 +128,72 @@ app.post('/v1/chat/completions', async (req, res) => {
             res.setHeader('Connection', 'keep-alive');
 
             let buffer = '';
-            let reasoningStarted = false;
+            // started   = have we already emitted the opening <think> for this message?
+            // inReasoningField = are we currently inside a stream of reasoning_content deltas?
+            let started = false;
+            let inReasoningField = false;
 
-            // FIX: Using nimResponse instead of 'response' to avoid 500 error
             nimResponse.data.on('data', (chunk) => {
                 buffer += chunk.toString();
                 const lines = buffer.split('\n');
                 buffer = lines.pop() || '';
 
                 lines.forEach(line => {
-                    if (line.startsWith('data: ')) {
-                        if (line.includes('[DONE]')) {
-                            res.write(line + '\n');
-                            return;
-                        }
-                        try {
-                            const data = JSON.parse(line.slice(6));
-                            if (data.choices?.[0]?.delta) {
-                                let content = data.choices[0].delta.content || '';
-                                let reasoning = data.choices[0].delta.reasoning_content || '';
-                            
-                                if (SHOW_REASONING) {
-                                    if (reasoning) {
-                                        if (!reasoningStarted) {
-                                            // Injects the opening markdown block
-                                            data.choices[0].delta.content = '<think>\n' + reasoning;
-                                            reasoningStarted = true;
-                                        } else {
-                                            data.choices[0].delta.content = reasoning;
-                                        }
-                                    } else if (content) {
-                                        if (reasoningStarted) {
-                                            // Safely wraps it when the primary generation begins
-                                            data.choices[0].delta.content = '</think>\n\n' + content;
-                                            reasoningStarted = false;
-                                        } else {
-                                            data.choices[0].delta.content = content;
-                                        }
-                                    }
+                    if (!line.startsWith('data: ')) return;
+
+                    if (line.includes('[DONE]')) {
+                        res.write(line + '\n');
+                        return;
+                    }
+
+                    try {
+                        const data = JSON.parse(line.slice(6));
+                        const delta = data.choices?.[0]?.delta;
+
+                        if (delta && SHOW_REASONING) {
+                            const content = delta.content || '';
+                            const reasoning = delta.reasoning_content || '';
+                            let out = '';
+
+                            // CASE A: model exposes a separate reasoning_content field
+                            if (reasoning) {
+                                if (!started) {
+                                    out += '<think>\n';
+                                    started = true;
                                 }
-                                
-                                // Deletes the non-standard property right before sending to client
-                                delete data.choices[0].delta.reasoning_content;
-                            }          
-                            // This line sends the data to JanitorAI
-                            res.write(`data: ${JSON.stringify(data)}\n\n`);
-                        } catch (e) {
-                            res.write(line + '\n');
+                                inReasoningField = true;
+                                out += reasoning;
+                            }
+
+                            // CASE B: normal content. This is also the path for models that
+                            // stream the chain-of-thought INLINE and only emit the closing
+                            // </think> (the opening tag is pre-filled by the chat template
+                            // and never appears in the output). We force the opening tag here.
+                            if (content) {
+                                if (!started) {
+                                    // Only prepend if the model has not emitted its own opener.
+                                    if (!content.trimStart().startsWith('<think>')) {
+                                        out += '<think>\n';
+                                    }
+                                    started = true;
+                                } else if (inReasoningField) {
+                                    // We were streaming reasoning_content and the answer is
+                                    // now beginning, so close the think block.
+                                    out += '</think>\n\n';
+                                    inReasoningField = false;
+                                }
+                                out += content;
+                            }
+
+                            delta.content = out;
                         }
+
+                        // Remove the non-standard property before sending to the client.
+                        if (delta) delete delta.reasoning_content;
+
+                        res.write(`data: ${JSON.stringify(data)}\n\n`);
+                    } catch (e) {
+                        res.write(line + '\n');
                     }
                 });
             });
@@ -196,9 +213,18 @@ app.post('/v1/chat/completions', async (req, res) => {
                 model: model,
                 choices: nimResponse.data.choices.map(choice => {
                     let fullContent = choice.message?.content || '';
-                    if (SHOW_REASONING && choice.message?.reasoning_content) {
-                        fullContent = '<think>\n' + choice.message.reasoning_content + '\n</think>\n\n' + fullContent;
+                    const reasoning = choice.message?.reasoning_content;
+
+                    if (SHOW_REASONING) {
+                        if (reasoning) {
+                            // Separate reasoning field -> build the whole block ourselves.
+                            fullContent = '<think>\n' + reasoning + '\n</think>\n\n' + fullContent;
+                        } else if (fullContent.includes('</think>') && !fullContent.trimStart().startsWith('<think>')) {
+                            // Inline chain-of-thought that is missing only its opener.
+                            fullContent = '<think>\n' + fullContent;
+                        }
                     }
+
                     return {
                         index: choice.index,
                         message: {
