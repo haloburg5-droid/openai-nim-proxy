@@ -17,10 +17,16 @@ const NIM_API_BASE = process.env.NIM_API_BASE || 'https://integrate.api.nvidia.c
 const NIM_API_KEY = process.env.NIM_API_KEY;
 
 // REASONING DISPLAY TOGGLE - Shows/hides reasoning in output
-const SHOW_REASONING = true; // Set to true to show reasoning with <think> tags
+const SHOW_REASONING = false; // hide <think> reasoning from the chat output
 
-// THINKING MODE TOGGLE - Enables thinking for specific models that support it
-const ENABLE_THINKING_MODE = true; // Set to true to enable chat_template_kwargs thinking parameter
+// THINKING MODE TOGGLE - Enables thinking for models that support it
+// OFF by default: forcing thinking on GLM with a heavy prompt (e.g. KERNEL) is
+// what makes it loop inside <think>. Set back to true only if you want it.
+const ENABLE_THINKING_MODE = false;
+
+// Use the value the client (JanitorAI) sends; if it is missing or 0, fall back
+// to an anti-repetition default so replies do not lock into the same phrasing.
+const pick = (v, def) => (v === undefined || v === null || v === 0) ? def : v;
 
 // Model mapping (adjust based on available NIM models)
 const MODEL_MAPPING = {
@@ -61,7 +67,11 @@ app.get('/v1/models', (req, res) => {
 // Chat completions endpoint (main proxy)
 app.post('/v1/chat/completions', async (req, res) => {
     try {
-        const { model, messages, temperature, max_tokens, stream } = req.body;
+        // Pull the sampling params too, so JanitorAI's sliders actually reach NIM.
+        const {
+            model, messages, temperature, max_tokens, stream,
+            top_p, top_k, frequency_penalty, presence_penalty, repetition_penalty
+        } = req.body;
 
         // Smart model selection with fallback
         let nimModel = MODEL_MAPPING[model];
@@ -100,15 +110,22 @@ app.post('/v1/chat/completions', async (req, res) => {
         const nimRequest = {
           model: nimModel,
           messages: messages,
-          temperature: temperature || 0.6,
-          max_tokens: max_tokens || 9024,
+          temperature: temperature || 0.9,
+          max_tokens: (max_tokens && max_tokens > 0) ? max_tokens : 2048,
           stream: stream || false,
+
+          // --- Anti-repetition sampling (this is the part that was missing) ---
+          top_p: pick(top_p, 0.9),
+          frequency_penalty: pick(frequency_penalty, 0.5), // main lever: punishes recurring tokens like "he said it"
+          presence_penalty: pick(presence_penalty, 0.4),   // nudges toward new vocabulary
+          // top_k: pick(top_k, 60),                        // uncomment if your NIM model accepts top_k
+          // repetition_penalty: pick(repetition_penalty, 1.1), // uncomment if accepted (non-OpenAI; some NIM models 422 on this)
 
           // Inject precise parameters for Qwen and GLM directly into chat_template_kwargs
           ...(ENABLE_THINKING_MODE ? {
             chat_template_kwargs: {
               ...(nimModel.toLowerCase().includes('qwen') ? { thinking: true } : {}),
-              ...(nimModel.toLowerCase().includes('glm') ? { thinking: true } : {}) // NVIDIA NIM requires 'thinking: true' for GLM as well
+              ...(nimModel.toLowerCase().includes('glm') ? { thinking: true } : {})
             }
           } : {})
         };
@@ -128,8 +145,6 @@ app.post('/v1/chat/completions', async (req, res) => {
             res.setHeader('Connection', 'keep-alive');
 
             let buffer = '';
-            // started   = have we already emitted the opening <think> for this message?
-            // inReasoningField = are we currently inside a stream of reasoning_content deltas?
             let started = false;
             let inReasoningField = false;
 
@@ -155,7 +170,6 @@ app.post('/v1/chat/completions', async (req, res) => {
                             const reasoning = delta.reasoning_content || '';
                             let out = '';
 
-                            // CASE A: model exposes a separate reasoning_content field
                             if (reasoning) {
                                 if (!started) {
                                     out += '<think>\n';
@@ -165,20 +179,13 @@ app.post('/v1/chat/completions', async (req, res) => {
                                 out += reasoning;
                             }
 
-                            // CASE B: normal content. This is also the path for models that
-                            // stream the chain-of-thought INLINE and only emit the closing
-                            // </think> (the opening tag is pre-filled by the chat template
-                            // and never appears in the output). We force the opening tag here.
                             if (content) {
                                 if (!started) {
-                                    // Only prepend if the model has not emitted its own opener.
                                     if (!content.trimStart().startsWith('<think>')) {
                                         out += '<think>\n';
                                     }
                                     started = true;
                                 } else if (inReasoningField) {
-                                    // We were streaming reasoning_content and the answer is
-                                    // now beginning, so close the think block.
                                     out += '</think>\n\n';
                                     inReasoningField = false;
                                 }
@@ -217,10 +224,8 @@ app.post('/v1/chat/completions', async (req, res) => {
 
                     if (SHOW_REASONING) {
                         if (reasoning) {
-                            // Separate reasoning field -> build the whole block ourselves.
                             fullContent = '<think>\n' + reasoning + '\n</think>\n\n' + fullContent;
                         } else if (fullContent.includes('</think>') && !fullContent.trimStart().startsWith('<think>')) {
-                            // Inline chain-of-thought that is missing only its opener.
                             fullContent = '<think>\n' + fullContent;
                         }
                     }
