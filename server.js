@@ -45,11 +45,39 @@ const ZERO_MEANS_UNSET = process.env.ZERO_MEANS_UNSET !== 'false';
 // Log each outgoing request's sampler set. Handy while tuning.
 const DEBUG = process.env.DEBUG === 'true';
 
-// Applied ONLY when the client omits the value (or sends 0, see ZERO_MEANS_UNSET).
+// NVIDIA takes models offline without warning ("DEGRADED function cannot be invoked")
+// and not every catalogue model is callable on every account ("not found for account").
+// When that happens, transparently retry on the next model in this list instead of
+// throwing an error into the chat. Set FALLBACK_MODELS="" to disable.
+const FALLBACK_MODELS = (
+  process.env.FALLBACK_MODELS ??
+  'deepseek-ai/deepseek-v4-pro,meta/llama-3.1-70b-instruct,meta/llama-3.1-8b-instruct'
+).split(',').map((s) => s.trim()).filter(Boolean);
+
+// max_tokens is a hard guillotine, not a target: generation stops the moment it is hit,
+// mid-sentence if necessary. It must cover the WHOLE completion, so a preset asking for
+// 400-600 words (~800 tokens) that ALSO runs a chain-of-thought block needs budget for both.
+//
+// MAX_TOKENS env var:
+//   unset / 'none' / 'unlimited' / '0'  -> send NO max_tokens at all. The model writes until
+//                                          it finishes or hits the context limit. This is the
+//                                          default, and matches "no limit".
+//   a number (e.g. 2048)                -> use it whenever the client does not send its own.
+//
+// A client value always wins. SillyTavern sends its "Response (tokens)" slider, so set it
+// there. JanitorAI sends 0 or nothing, which is what this default covers.
+//
+// Trade-off of unlimited: a runaway reply can exceed a gateway timeout (Vercel/Cloudflare cut
+// at ~100s). Keep streaming ON to mitigate that, and if 524s appear, set MAX_TOKENS=2048.
+const MAX_TOKENS_RAW = String(process.env.MAX_TOKENS ?? '').trim().toLowerCase();
+const MAX_TOKENS_DEFAULT =
+  (MAX_TOKENS_RAW === '' || MAX_TOKENS_RAW === '0' || MAX_TOKENS_RAW === 'none' || MAX_TOKENS_RAW === 'unlimited')
+    ? null                              // null = omit the field entirely = no limit
+    : (Number(MAX_TOKENS_RAW) || null);
+
 const DEFAULTS = {
   temperature:       0.8,   // GLM 5.2 community sweet spot
   top_p:             0.95,  // GLM default; avoid tuning this and temperature together
-  max_tokens:        1024,  // keeps replies tight and avoids Cloudflare 524 timeouts
   frequency_penalty: 0.2,   // mild anti-repetition; higher values wreck long replies
   presence_penalty:  0.2
 };
@@ -84,7 +112,7 @@ const MODEL_MAPPING = {
   'gpt-4o':         'nvidia/nemotron-3-ultra-550b-a55b',
   'claude-3-opus':  'z-ai/glm-5.2',
   'claude-3-sonnet':'deepseek-ai/deepseek-v4-pro',
-  'gemini-pro':     'mistralai/mistral-medium-3.5-128b'
+  'gemini-pro':     'mistralai/mistral-large-3-675b-instruct-2512'
 };
 
 // ---------------------------------------------------------------------------
@@ -157,9 +185,12 @@ function buildPayload(body, nimModel, { includeExtended = true } = {}) {
     }
   }
 
-  // max_tokens of 0 or less means "unlimited" in some clients; clamp it so replies
-  // cannot run forever and trip a gateway timeout.
-  if (!payload.max_tokens || payload.max_tokens <= 0) payload.max_tokens = DEFAULTS.max_tokens;
+  // A client sending 0 (or nothing) means "no preference". Fall back to MAX_TOKENS if one
+  // is configured, otherwise omit the field entirely so the model is uncapped.
+  if (!payload.max_tokens || payload.max_tokens <= 0) {
+    if (MAX_TOKENS_DEFAULT) payload.max_tokens = MAX_TOKENS_DEFAULT;
+    else delete payload.max_tokens;
+  }
 
   // SillyTavern sends stop sequences as `stop` or `stop_sequence`; normalise and cap at 4.
   const stops = body.stop ?? body.stop_sequence ?? body.stopping_strings;
@@ -187,6 +218,28 @@ function buildPayload(body, nimModel, { includeExtended = true } = {}) {
   return payload;
 }
 
+// An axios error body is a stream when responseType was 'stream', so read it back to text.
+async function readErrorBody(error) {
+  const data = error.response?.data;
+  if (!data) return null;
+  if (typeof data === 'string') return data;
+  if (typeof data.pipe === 'function') {
+    try {
+      const chunks = [];
+      for await (const c of data) chunks.push(c);
+      return Buffer.concat(chunks).toString();
+    } catch (_) { return null; }
+  }
+  return JSON.stringify(data);
+}
+
+// True when the model itself is the problem, so a different model would likely work.
+function isModelUnavailable(status, bodyText) {
+  if (status !== 400 && status !== 404) return false;
+  const t = (bodyText || '').toLowerCase();
+  return t.includes('degraded') || t.includes('not found for account') || t.includes('does not exist');
+}
+
 async function callNim(payload, wantStream) {
   return axios.post(`${NIM_API_BASE}/chat/completions`, payload, {
     headers: { Authorization: `Bearer ${NIM_API_KEY}`, 'Content-Type': 'application/json' },
@@ -208,6 +261,32 @@ app.get(['/health', '/v1/health'], (req, res) => {
     zero_means_unset: ZERO_MEANS_UNSET,
     defaults: DEFAULTS
   });
+});
+
+// Diagnostic: ask NVIDIA which models THIS account can actually call.
+// Open in a browser to get the authoritative list. Add ?q=glm to filter.
+// Use this whenever you get "Function ... not found for account", which means the
+// model id you asked for is not callable with your key.
+app.get('/nim/models', async (req, res) => {
+  try {
+    const upstream = await axios.get(`${NIM_API_BASE}/models`, {
+      headers: { Authorization: `Bearer ${NIM_API_KEY}` },
+      timeout: 20000
+    });
+    let ids = (upstream.data?.data || []).map((m) => m.id).sort();
+    if (req.query.q) {
+      const q = String(req.query.q).toLowerCase();
+      ids = ids.filter((id) => id.toLowerCase().includes(q));
+    }
+    res.json({ count: ids.length, models: ids });
+  } catch (error) {
+    res.status(error.response?.status || 500).json({
+      error: {
+        message: error.response?.data?.error?.message || error.message,
+        hint: 'If this fails, the NIM_API_KEY is wrong or lacks access.'
+      }
+    });
+  }
 });
 
 app.get(['/v1/models', '/models'], (req, res) => {
@@ -247,22 +326,50 @@ app.post(['/v1/chat/completions', '/chat/completions'], async (req, res) => {
       if (dropped.length) console.log('[proxy] dropped unsupported:', dropped.join(', '));
     }
 
-    let nimResponse;
-    try {
-      nimResponse = await callNim(payload, wantStream);
-    } catch (err) {
-      // NIM rejected something. Most often that is an extended sampler this model
-      // does not implement, so drop them and try once more before giving up.
-      const status = err.response?.status;
-      const hadExtended = EXTENDED_PARAMS.some((k) => payload[k] !== undefined);
-      if ((status === 400 || status === 422) && hadExtended) {
-        console.warn('[proxy] retrying without extended sampler params after', status);
-        payload = buildPayload(req.body, nimModel, { includeExtended: false });
+    // Try the requested model, then each fallback, if the model itself is unavailable.
+    const candidates = [nimModel, ...FALLBACK_MODELS.filter((m) => m !== nimModel)];
+    let nimResponse = null;
+    let lastError = null;
+    let servedBy = nimModel;
+
+    for (const candidate of candidates) {
+      payload = buildPayload(req.body, candidate);
+      try {
         nimResponse = await callNim(payload, wantStream);
-      } else {
-        throw err;
+        servedBy = candidate;
+        break;
+      } catch (err) {
+        const status = err.response?.status;
+        const bodyText = await readErrorBody(err);
+
+        // A rejected sampler is fixable on this same model: strip extras and retry once.
+        const hadExtended = EXTENDED_PARAMS.some((k) => payload[k] !== undefined);
+        if ((status === 400 || status === 422) && hadExtended && !isModelUnavailable(status, bodyText)) {
+          console.warn(`[proxy] ${candidate}: retrying without extended sampler params after ${status}`);
+          try {
+            payload = buildPayload(req.body, candidate, { includeExtended: false });
+            nimResponse = await callNim(payload, wantStream);
+            servedBy = candidate;
+            break;
+          } catch (err2) {
+            lastError = err2;
+            if (!isModelUnavailable(err2.response?.status, await readErrorBody(err2))) throw err2;
+            console.warn(`[proxy] ${candidate} unavailable, trying next model`);
+            continue;
+          }
+        }
+
+        lastError = err;
+        if (isModelUnavailable(status, bodyText)) {
+          console.warn(`[proxy] ${candidate} unavailable (${status}), trying next model`);
+          continue; // model is down or not on this account: try the next one
+        }
+        throw err; // a real error (auth, rate limit, bad request): surface it
       }
     }
+
+    if (!nimResponse) throw lastError || new Error('No NIM model available');
+    if (servedBy !== nimModel) console.warn(`[proxy] served by fallback: ${servedBy} (wanted ${nimModel})`);
 
     // ---- streaming ----
     if (wantStream) {
