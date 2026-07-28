@@ -84,7 +84,7 @@ const MODEL_MAPPING = {
   'gpt-4o':         'nvidia/nemotron-3-ultra-550b-a55b',
   'claude-3-opus':  'z-ai/glm-5.2',
   'claude-3-sonnet':'deepseek-ai/deepseek-v4-pro',
-  'gemini-pro':     'mistralai/mixtral-8x7b-instruct-v0.1'
+  'gemini-pro':     'mistralai/mistral-medium-3.5-128b'
 };
 
 // ---------------------------------------------------------------------------
