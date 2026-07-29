@@ -100,6 +100,26 @@ const CORE_PARAMS = [
 // Accepted by most but not all NIM models. Stripped and retried on a 400/422.
 const EXTENDED_PARAMS = ['top_k', 'repetition_penalty', 'min_p', 'ignore_eos', 'min_tokens'];
 
+// Some slider values are valid to the API but catastrophic for roleplay, because they
+// REWARD repetition instead of discouraging it. A model given these will emit one token
+// forever ("[[[[[[[", "XXXXXX"):
+//   frequency_penalty / presence_penalty < 0  -> negative penalty = bonus for repeats
+//   repetition_penalty < 1                    -> below 1.0 rewards repeats (1.0 = neutral)
+// Clamp them to the neutral floor and log it. Set CLAMP_SAMPLERS=false to allow raw values.
+const CLAMP_SAMPLERS = process.env.CLAMP_SAMPLERS !== 'false';
+const SAMPLER_FLOORS = { frequency_penalty: 0, presence_penalty: 0, repetition_penalty: 1 };
+
+function clampSamplers(payload) {
+  if (!CLAMP_SAMPLERS) return payload;
+  for (const [key, floor] of Object.entries(SAMPLER_FLOORS)) {
+    if (payload[key] !== undefined && payload[key] < floor) {
+      console.warn(`[proxy] clamped ${key} ${payload[key]} -> ${floor} (values below ${floor} cause repetition loops)`);
+      payload[key] = floor;
+    }
+  }
+  return payload;
+}
+
 // Samplers SillyTavern offers that NIM does not implement. Dropped silently so they
 // never trigger a 400. (ST's docs note these have no effect on stricter endpoints.)
 const UNSUPPORTED = [
@@ -219,7 +239,7 @@ function buildPayload(body, nimModel, { includeExtended = true } = {}) {
     if (Object.keys(kwargs).length) payload.chat_template_kwargs = kwargs;
   }
 
-  return payload;
+  return clampSamplers(payload);
 }
 
 // An axios error body is a stream when responseType was 'stream', so read it back to text.
