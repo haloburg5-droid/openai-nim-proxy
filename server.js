@@ -325,6 +325,82 @@ app.get(['/v1/models', '/models'], (req, res) => {
   });
 });
 
+// ---------------------------------------------------------------------------
+// DIAGNOSTIC ECHO. Point your client's proxy URL at /echo/v1/chat/completions and
+// send a message: instead of calling NVIDIA, the reply IS a dump of exactly what
+// arrived here. Use it to see what a client (or a middleman like LoreBary) really
+// sends, and to compare two clients against each other.
+// ---------------------------------------------------------------------------
+app.post(['/echo/v1/chat/completions', '/echo/chat/completions'], (req, res) => {
+  const b = req.body || {};
+  const msgs = Array.isArray(b.messages) ? b.messages : [];
+
+  const lines = [];
+  lines.push('=== ECHO: what this proxy received ===');
+  lines.push(`model: ${JSON.stringify(b.model)}   stream: ${JSON.stringify(b.stream)}`);
+  lines.push(`content-type: ${req.headers['content-type'] || 'none'}`);
+  lines.push(`user-agent: ${(req.headers['user-agent'] || 'none').slice(0, 80)}`);
+
+  const samplers = ['temperature','top_p','top_k','max_tokens','frequency_penalty',
+                    'presence_penalty','repetition_penalty','min_p','seed','stop'];
+  lines.push('samplers: ' + samplers
+    .filter((k) => b[k] !== undefined)
+    .map((k) => `${k}=${JSON.stringify(b[k])}`).join(', ') || 'samplers: (none sent)');
+
+  const unknown = Object.keys(b).filter(
+    (k) => !['model','messages','stream','prompt', ...samplers].includes(k)
+  );
+  lines.push(`other keys: ${unknown.length ? unknown.join(', ') : '(none)'}`);
+
+  lines.push('');
+  lines.push(`messages: ${msgs.length}`);
+  const total = msgs.reduce((n, m) => n + String(m?.content ?? '').length, 0);
+  lines.push(`total content chars: ${total} (~${Math.round(total / 4)} tokens)`);
+  lines.push('');
+
+  msgs.forEach((m, i) => {
+    const c = typeof m?.content === 'string' ? m.content : JSON.stringify(m?.content);
+    const text = String(c ?? '');
+    lines.push(`--- [${i}] role=${JSON.stringify(m?.role)} len=${text.length} ---`);
+    lines.push(text.length > 300 ? text.slice(0, 200) + '\n   ...[trimmed]...\n' + text.slice(-100) : text);
+  });
+
+  // Flag the things that most often break a model.
+  lines.push('');
+  lines.push('=== sanity checks ===');
+  lines.push(`empty/blank message contents : ${msgs.filter((m) => !String(m?.content ?? '').trim()).length}`);
+  lines.push(`non-string contents          : ${msgs.filter((m) => typeof m?.content !== 'string').length}`);
+  lines.push(`roles in order               : ${msgs.map((m) => m?.role).join(' > ') || '(none)'}`);
+  lines.push(`last role                    : ${msgs.length ? JSON.stringify(msgs[msgs.length - 1].role) : '(none)'}`);
+  const looksJson = msgs.some((m) => /^\s*[[{]\s*"?(role|messages)"?\s*[:[]/.test(String(m?.content ?? '')));
+  lines.push(`content looks double-encoded : ${looksJson}`);
+
+  const dump = lines.join('\n');
+  console.log('[echo]\n' + dump);
+
+  if (b.stream === true) {
+    res.setHeader('Content-Type', 'text/event-stream');
+    res.setHeader('Cache-Control', 'no-cache');
+    res.setHeader('X-Accel-Buffering', 'no');
+    res.write(`data: ${JSON.stringify({
+      id: 'echo', object: 'chat.completion.chunk', created: Math.floor(Date.now() / 1000),
+      model: 'echo', choices: [{ index: 0, delta: { role: 'assistant', content: dump }, finish_reason: null }]
+    })}\n\n`);
+    res.write(`data: ${JSON.stringify({
+      id: 'echo', object: 'chat.completion.chunk', created: Math.floor(Date.now() / 1000),
+      model: 'echo', choices: [{ index: 0, delta: {}, finish_reason: 'stop' }]
+    })}\n\n`);
+    res.write('data: [DONE]\n\n');
+    return res.end();
+  }
+
+  res.json({
+    id: 'echo', object: 'chat.completion', created: Math.floor(Date.now() / 1000), model: 'echo',
+    choices: [{ index: 0, message: { role: 'assistant', content: dump }, finish_reason: 'stop' }],
+    usage: { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 }
+  });
+});
+
 app.post(['/v1/chat/completions', '/chat/completions'], async (req, res) => {
   const wantStream = req.body?.stream === true;
 
