@@ -237,6 +237,26 @@ async function readErrorBody(error) {
   return JSON.stringify(data);
 }
 
+// --- Degeneration guard -----------------------------------------------------
+// A model can collapse into emitting one tiny token forever ("[[[[[[[", "XXXXXX").
+// Once that starts it never recovers, and if the junk lands in the chat history it
+// poisons every later turn. So we cut it off rather than relay thousands of tokens.
+const DEGEN_REPEATS = Number(process.env.DEGEN_REPEATS) || 30;
+
+// Trailing run of one repeated short fragment? Return where it starts, else -1.
+function findDegenerateTail(text) {
+  if (!text || text.length < DEGEN_REPEATS) return -1;
+  for (let unit = 1; unit <= 3; unit++) {
+    const tail = text.slice(-unit);
+    if (!tail.trim()) continue;              // ignore whitespace runs
+    let count = 0;
+    let i = text.length;
+    while (i - unit >= 0 && text.slice(i - unit, i) === tail) { count++; i -= unit; }
+    if (count >= DEGEN_REPEATS) return i;
+  }
+  return -1;
+}
+
 // True when the model itself is the problem, so a different model would likely work.
 function isModelUnavailable(status, bodyText) {
   if (status !== 400 && status !== 404) return false;
@@ -391,7 +411,13 @@ app.post(['/v1/chat/completions', '/chat/completions'], async (req, res) => {
       let openedThink = false;
       let inReasoning = false;
 
+      // Degeneration tracking: how many times the same tiny delta has arrived in a row.
+      let lastDelta = null;
+      let repeatRun = 0;
+      let aborted = false;
+
       nimResponse.data.on('data', (chunk) => {
+        if (aborted) return;
         buffer += chunk.toString();
         const lines = buffer.split('\n');
         buffer = lines.pop() || '';
@@ -428,6 +454,32 @@ app.post(['/v1/chat/completions', '/chat/completions'], async (req, res) => {
                 if (out) delta.content = out;
               }
               delete delta.reasoning_content; // non-standard; clients choke on it
+
+              // Watch for the same tiny fragment arriving over and over.
+              const piece = delta.content || '';
+              if (piece && piece.trim() && piece.length <= 3) {
+                if (piece === lastDelta) {
+                  repeatRun++;
+                } else {
+                  lastDelta = piece;
+                  repeatRun = 1;
+                }
+                if (repeatRun >= DEGEN_REPEATS) {
+                  console.error(`[proxy] degenerate output detected (${JSON.stringify(piece)} x${repeatRun}) - aborting stream`);
+                  aborted = true;
+                  try { nimResponse.data.destroy(); } catch (_) {}
+                  res.write(`data: ${JSON.stringify({
+                    id: data.id,
+                    object: 'chat.completion.chunk',
+                    choices: [{ index: 0, delta: {}, finish_reason: 'length' }]
+                  })}\n\n`);
+                  res.write('data: [DONE]\n\n');
+                  return res.end();
+                }
+              } else if (piece && piece.trim()) {
+                lastDelta = null;
+                repeatRun = 0;
+              }
             }
 
             res.write(`data: ${JSON.stringify(data)}\n\n`);
@@ -438,6 +490,7 @@ app.post(['/v1/chat/completions', '/chat/completions'], async (req, res) => {
       });
 
       nimResponse.data.on('end', () => {
+        if (aborted || res.writableEnded) return; // degeneration guard already closed it
         if (SHOW_REASONING && inReasoning) {
           // Stream ended while still inside reasoning: close the tag so the client
           // does not render a dangling <think>.
@@ -450,6 +503,7 @@ app.post(['/v1/chat/completions', '/chat/completions'], async (req, res) => {
       });
 
       nimResponse.data.on('error', (err) => {
+        if (aborted || res.writableEnded) return;
         console.error('[proxy] stream error:', err.message);
         res.end();
       });
@@ -461,6 +515,13 @@ app.post(['/v1/chat/completions', '/chat/completions'], async (req, res) => {
     const choices = (nimResponse.data.choices || []).map((choice) => {
       let content = choice.message?.content || '';
       const reasoning = choice.message?.reasoning_content;
+
+      // Strip a degenerate repeated tail so the client never renders a wall of junk.
+      const degenAt = findDegenerateTail(content);
+      if (degenAt > -1) {
+        console.error(`[proxy] degenerate tail trimmed at char ${degenAt} of ${content.length}`);
+        content = content.slice(0, degenAt).trimEnd();
+      }
 
       if (SHOW_REASONING) {
         if (reasoning) {
