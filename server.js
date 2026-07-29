@@ -47,11 +47,15 @@ const DEBUG = process.env.DEBUG === 'true';
 
 // NVIDIA takes models offline without warning ("DEGRADED function cannot be invoked")
 // and not every catalogue model is callable on every account ("not found for account").
-// When that happens, transparently retry on the next model in this list instead of
-// throwing an error into the chat. Set FALLBACK_MODELS="" to disable.
+// When that happens, retry on the next model in this list instead of erroring.
+//
+// IMPORTANT: only list models strong enough for your prompt. A heavy RP preset (long
+// system prompt + chain-of-thought + strict formatting) will make a small model degenerate
+// into repeated-token garbage like "[[[[[[[[". That is why no 8B model is listed here.
+// Set FALLBACK_MODELS="" to disable fallback entirely and get a clear error instead.
 const FALLBACK_MODELS = (
   process.env.FALLBACK_MODELS ??
-  'deepseek-ai/deepseek-v4-pro,meta/llama-3.1-70b-instruct,meta/llama-3.1-8b-instruct'
+  'deepseek-ai/deepseek-v4-pro,meta/llama-3.1-70b-instruct'
 ).split(',').map((s) => s.trim()).filter(Boolean);
 
 // max_tokens is a hard guillotine, not a target: generation stops the moment it is hit,
@@ -371,6 +375,10 @@ app.post(['/v1/chat/completions', '/chat/completions'], async (req, res) => {
     if (!nimResponse) throw lastError || new Error('No NIM model available');
     if (servedBy !== nimModel) console.warn(`[proxy] served by fallback: ${servedBy} (wanted ${nimModel})`);
 
+    // Always expose which model actually answered, so a silent fallback is visible.
+    res.setHeader('X-Served-Model', servedBy);
+    res.setHeader('X-Requested-Model', nimModel);
+
     // ---- streaming ----
     if (wantStream) {
       res.setHeader('Content-Type', 'text/event-stream');
@@ -473,7 +481,7 @@ app.post(['/v1/chat/completions', '/chat/completions'], async (req, res) => {
       id: nimResponse.data.id || `chatcmpl-${Date.now()}`,
       object: 'chat.completion',
       created: Math.floor(Date.now() / 1000),
-      model: req.body.model,
+      model: servedBy,   // the model that actually answered, not the alias asked for
       choices,
       usage: nimResponse.data.usage || { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 }
     });
