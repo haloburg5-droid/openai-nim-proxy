@@ -31,11 +31,11 @@ const NIM_API_KEY  = process.env.NIM_API_KEY;
 // Show the model's reasoning wrapped in <think> tags.
 // false = strip it. SillyTavern can parse/fold <think> itself, so set SHOW_REASONING=true
 // there if you want to see it; JanitorAI folds it too but is happier without.
-const SHOW_REASONING = process.env.SHOW_REASONING === 'true';
+const SHOW_REASONING = process.env.SHOW_REASONING === 'false';
 
 // Ask GLM/Qwen to use their native thinking mode. Off by default: combined with a
 // heavy system prompt it makes GLM loop inside <think>.
-const ENABLE_THINKING_MODE = process.env.ENABLE_THINKING_MODE === 'true';
+const ENABLE_THINKING_MODE = process.env.ENABLE_THINKING_MODE === 'false';
 
 // JanitorAI sends 0 for sliders the user never touched, which is indistinguishable from
 // a deliberate 0. When true, a 0 for the penalty/top_k family is treated as "unset" so the
@@ -130,13 +130,13 @@ const UNSUPPORTED = [
 ];
 
 const MODEL_MAPPING = {
-  'gpt-3.5-turbo':  'deepseek-ai/deepseek-v4-flash',
-  'gpt-4':          'qwen/qwen3.5-397b-a17b',
-  'gpt-4-turbo':    'moonshotai/kimi-k2.6',
+  'gpt-3.5-turbo':  'thinkingmachines/inkling',
+  'gpt-4':          'mistralai/mistral-nemotron',
+  'gpt-4-turbo':    'openai/gpt-oss-120b',
   'gpt-4o':         'nvidia/nemotron-3-ultra-550b-a55b',
   'claude-3-opus':  'z-ai/glm-5.2',
-  'claude-3-sonnet':'deepseek-ai/deepseek-v4-pro',
-  'gemini-pro':     'mistralai/mistral-large-3-675b-instruct-2512'
+  'claude-3-sonnet':'meta/muse-glimmer-30b',
+  'gemini-pro':     'poolside/laguna-xs-2.1'
 };
 
 // ---------------------------------------------------------------------------
