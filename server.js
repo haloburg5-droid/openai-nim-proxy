@@ -31,11 +31,11 @@ const NIM_API_KEY  = process.env.NIM_API_KEY;
 // Show the model's reasoning wrapped in <think> tags.
 // false = strip it. SillyTavern can parse/fold <think> itself, so set SHOW_REASONING=true
 // there if you want to see it; JanitorAI folds it too but is happier without.
-const SHOW_REASONING = process.env.SHOW_REASONING === 'false';
+const SHOW_REASONING = process.env.SHOW_REASONING === 'true';
 
 // Ask GLM/Qwen to use their native thinking mode. Off by default: combined with a
 // heavy system prompt it makes GLM loop inside <think>.
-const ENABLE_THINKING_MODE = process.env.ENABLE_THINKING_MODE === 'false';
+const ENABLE_THINKING_MODE = process.env.ENABLE_THINKING_MODE === 'true';
 
 // JanitorAI sends 0 for sliders the user never touched, which is indistinguishable from
 // a deliberate 0. When true, a 0 for the penalty/top_k family is treated as "unset" so the
