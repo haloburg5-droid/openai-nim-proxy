@@ -131,12 +131,12 @@ const UNSUPPORTED = [
 
 const MODEL_MAPPING = {
   'gpt-3.5-turbo':  'thinkingmachines/inkling',
-  'gpt-4':          'mistralai/mistral-nemotron',
+  'gpt-4':          'moonshotai/kimi-k3',
   'gpt-4-turbo':    'openai/gpt-oss-120b',
   'gpt-4o':         'nvidia/nemotron-3-ultra-550b-a55b',
   'claude-3-opus':  'z-ai/glm-5.2',
   'claude-3-sonnet':'meta/muse-glimmer-30b',
-  'gemini-pro':     'poolside/laguna-xs-2.1'
+  'gemini-pro':     'deepseek-ai/deepseek-v4-flash-0731'
 };
 
 // ---------------------------------------------------------------------------
