@@ -11,6 +11,8 @@
 //     "extended" bucket. If NIM 400/422s, we strip that bucket and retry once automatically.
 //   - Uses ?? (nullish) not ||, so an explicit 0 from the client is honoured rather than
 //     silently replaced by a default.
+//   - NO MODEL FALLBACK. The model you ask for is the model that is called. If it is down,
+//     misspelled, or not on your account, the request fails with NVIDIA's own error.
 
 const express = require('express');
 const cors = require('cors');
@@ -44,19 +46,6 @@ const ZERO_MEANS_UNSET = process.env.ZERO_MEANS_UNSET !== 'false';
 
 // Log each outgoing request's sampler set. Handy while tuning.
 const DEBUG = process.env.DEBUG === 'true';
-
-// NVIDIA takes models offline without warning ("DEGRADED function cannot be invoked")
-// and not every catalogue model is callable on every account ("not found for account").
-// When that happens, retry on the next model in this list instead of erroring.
-//
-// IMPORTANT: only list models strong enough for your prompt. A heavy RP preset (long
-// system prompt + chain-of-thought + strict formatting) will make a small model degenerate
-// into repeated-token garbage like "[[[[[[[[". That is why no 8B model is listed here.
-// Set FALLBACK_MODELS="" to disable fallback entirely and get a clear error instead.
-const FALLBACK_MODELS = (
-  process.env.FALLBACK_MODELS ??
-  'deepseek-ai/deepseek-v4-pro,meta/llama-3.1-70b-instruct'
-).split(',').map((s) => s.trim()).filter(Boolean);
 
 // max_tokens is a hard guillotine, not a target: generation stops the moment it is hit,
 // mid-sentence if necessary. It must cover the WHOLE completion, so a preset asking for
@@ -150,46 +139,17 @@ function isUnset(key, value) {
   return false;
 }
 
-// Remember models we have already confirmed exist, so we probe only once each.
-const verifiedModels = new Set();
-
-async function resolveModel(requestedModel) {
-  if (!requestedModel) return 'meta/llama-3.1-8b-instruct';
-
-  // Explicit alias from the table above.
-  if (MODEL_MAPPING[requestedModel]) return MODEL_MAPPING[requestedModel];
-
-  // Already checked this one.
-  if (verifiedModels.has(requestedModel)) return requestedModel;
-
-  // A vendor/model style name (what you type in SillyTavern) is almost certainly a real
-  // NIM id, so use it directly instead of burning a probe request.
-  if (requestedModel.includes('/')) {
-    verifiedModels.add(requestedModel);
-    return requestedModel;
+// Resolve a client-supplied model name to a NIM model id.
+// No probing, no heuristics, no substitution: an alias from MODEL_MAPPING is translated,
+// anything else is sent verbatim. If the id is wrong or the model is offline, NVIDIA's
+// own error is what the client sees.
+function resolveModel(requestedModel) {
+  if (!requestedModel) {
+    const err = new Error('model is required; this proxy does not choose one for you.');
+    err.status = 400;
+    throw err;
   }
-
-  // Unknown bare name: probe NIM once with a 1-token request.
-  try {
-    const probe = await axios.post(
-      `${NIM_API_BASE}/chat/completions`,
-      { model: requestedModel, messages: [{ role: 'user', content: 'test' }], max_tokens: 1 },
-      {
-        headers: { Authorization: `Bearer ${NIM_API_KEY}`, 'Content-Type': 'application/json' },
-        validateStatus: (s) => s < 500,
-        timeout: 15000
-      }
-    );
-    if (probe.status >= 200 && probe.status < 300) {
-      verifiedModels.add(requestedModel);
-      return requestedModel;
-    }
-  } catch (_) { /* fall through to heuristic */ }
-
-  const m = requestedModel.toLowerCase();
-  if (m.includes('gpt-4') || m.includes('opus') || m.includes('405b')) return 'meta/llama-3.1-405b-instruct';
-  if (m.includes('claude') || m.includes('gemini') || m.includes('70b')) return 'meta/llama-3.1-70b-instruct';
-  return 'meta/llama-3.1-8b-instruct';
+  return MODEL_MAPPING[requestedModel] || requestedModel;
 }
 
 // Turn an incoming client request into a NIM payload.
@@ -242,25 +202,11 @@ function buildPayload(body, nimModel, { includeExtended = true } = {}) {
   return clampSamplers(payload);
 }
 
-// An axios error body is a stream when responseType was 'stream', so read it back to text.
-async function readErrorBody(error) {
-  const data = error.response?.data;
-  if (!data) return null;
-  if (typeof data === 'string') return data;
-  if (typeof data.pipe === 'function') {
-    try {
-      const chunks = [];
-      for await (const c of data) chunks.push(c);
-      return Buffer.concat(chunks).toString();
-    } catch (_) { return null; }
-  }
-  return JSON.stringify(data);
-}
-
 // --- Degeneration guard -----------------------------------------------------
 // A model can collapse into emitting one tiny token forever ("[[[[[[[", "XXXXXX").
 // Once that starts it never recovers, and if the junk lands in the chat history it
 // poisons every later turn. So we cut it off rather than relay thousands of tokens.
+// This truncates the reply; it never re-routes to another model.
 const DEGEN_REPEATS = Number(process.env.DEGEN_REPEATS) || 30;
 
 // Trailing run of one repeated short fragment? Return where it starts, else -1.
@@ -275,13 +221,6 @@ function findDegenerateTail(text) {
     if (count >= DEGEN_REPEATS) return i;
   }
   return -1;
-}
-
-// True when the model itself is the problem, so a different model would likely work.
-function isModelUnavailable(status, bodyText) {
-  if (status !== 400 && status !== 404) return false;
-  const t = (bodyText || '').toLowerCase();
-  return t.includes('degraded') || t.includes('not found for account') || t.includes('does not exist');
 }
 
 async function callNim(payload, wantStream) {
@@ -303,6 +242,7 @@ app.get(['/health', '/v1/health'], (req, res) => {
     reasoning_display: SHOW_REASONING,
     thinking_mode: ENABLE_THINKING_MODE,
     zero_means_unset: ZERO_MEANS_UNSET,
+    model_fallback: false,
     defaults: DEFAULTS
   });
 });
@@ -436,7 +376,7 @@ app.post(['/v1/chat/completions', '/chat/completions'], async (req, res) => {
       });
     }
 
-    const nimModel = await resolveModel(req.body.model);
+    const nimModel = resolveModel(req.body.model);
     let payload = buildPayload(req.body, nimModel);
 
     if (DEBUG) {
@@ -446,54 +386,25 @@ app.post(['/v1/chat/completions', '/chat/completions'], async (req, res) => {
       if (dropped.length) console.log('[proxy] dropped unsupported:', dropped.join(', '));
     }
 
-    // Try the requested model, then each fallback, if the model itself is unavailable.
-    const candidates = [nimModel, ...FALLBACK_MODELS.filter((m) => m !== nimModel)];
-    let nimResponse = null;
-    let lastError = null;
-    let servedBy = nimModel;
-
-    for (const candidate of candidates) {
-      payload = buildPayload(req.body, candidate);
-      try {
+    // One model, one attempt. The only retry is a same-model payload fix: if NIM rejects
+    // an optional sampler, we drop that bucket and try once more. Every other failure
+    // (auth, rate limit, DEGRADED, unknown model) propagates to the client unchanged.
+    let nimResponse;
+    try {
+      nimResponse = await callNim(payload, wantStream);
+    } catch (err) {
+      const status = err.response?.status;
+      const hadExtended = EXTENDED_PARAMS.some((k) => payload[k] !== undefined);
+      if ((status === 400 || status === 422) && hadExtended) {
+        console.warn(`[proxy] ${nimModel}: retrying without extended sampler params after ${status}`);
+        payload = buildPayload(req.body, nimModel, { includeExtended: false });
         nimResponse = await callNim(payload, wantStream);
-        servedBy = candidate;
-        break;
-      } catch (err) {
-        const status = err.response?.status;
-        const bodyText = await readErrorBody(err);
-
-        // A rejected sampler is fixable on this same model: strip extras and retry once.
-        const hadExtended = EXTENDED_PARAMS.some((k) => payload[k] !== undefined);
-        if ((status === 400 || status === 422) && hadExtended && !isModelUnavailable(status, bodyText)) {
-          console.warn(`[proxy] ${candidate}: retrying without extended sampler params after ${status}`);
-          try {
-            payload = buildPayload(req.body, candidate, { includeExtended: false });
-            nimResponse = await callNim(payload, wantStream);
-            servedBy = candidate;
-            break;
-          } catch (err2) {
-            lastError = err2;
-            if (!isModelUnavailable(err2.response?.status, await readErrorBody(err2))) throw err2;
-            console.warn(`[proxy] ${candidate} unavailable, trying next model`);
-            continue;
-          }
-        }
-
-        lastError = err;
-        if (isModelUnavailable(status, bodyText)) {
-          console.warn(`[proxy] ${candidate} unavailable (${status}), trying next model`);
-          continue; // model is down or not on this account: try the next one
-        }
-        throw err; // a real error (auth, rate limit, bad request): surface it
+      } else {
+        throw err;
       }
     }
 
-    if (!nimResponse) throw lastError || new Error('No NIM model available');
-    if (servedBy !== nimModel) console.warn(`[proxy] served by fallback: ${servedBy} (wanted ${nimModel})`);
-
-    // Always expose which model actually answered, so a silent fallback is visible.
-    res.setHeader('X-Served-Model', servedBy);
-    res.setHeader('X-Requested-Model', nimModel);
+    res.setHeader('X-Served-Model', nimModel);
 
     // ---- streaming ----
     if (wantStream) {
@@ -638,13 +549,13 @@ app.post(['/v1/chat/completions', '/chat/completions'], async (req, res) => {
       id: nimResponse.data.id || `chatcmpl-${Date.now()}`,
       object: 'chat.completion',
       created: Math.floor(Date.now() / 1000),
-      model: servedBy,   // the model that actually answered, not the alias asked for
+      model: nimModel,
       choices,
       usage: nimResponse.data.usage || { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 }
     });
 
   } catch (error) {
-    const status = error.response?.status || 500;
+    const status = error.status || error.response?.status || 500;
     const upstream = error.response?.data;
     const message =
       upstream?.error?.message ||
@@ -678,6 +589,7 @@ if (require.main === module) {
     console.log(`  api key set    : ${Boolean(NIM_API_KEY)}`);
     console.log(`  reasoning shown: ${SHOW_REASONING}`);
     console.log(`  thinking mode  : ${ENABLE_THINKING_MODE}`);
+    console.log(`  model fallback : disabled (failures surface as errors)`);
   });
 }
 
